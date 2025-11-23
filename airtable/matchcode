@@ -1,0 +1,119 @@
+/********************
+ * MATCH SCRIPT v4 (recommended)
+ * - Position overlap REQUIRED (multi-position seekers)
+ * - Employment SOFT gate ON
+ * - Days overlap OFF (score handles day strength)
+ * - Avoid duplicates
+ ********************/
+
+const seekersTbl  = base.getTable("Job Seekers AT");
+const openingsTbl = base.getTable("Job Openings AT");
+const matchesTbl  = base.getTable("Matches");
+
+const FIELDS = {
+  seekerPosition: "Position",
+  seekerEmployment: "Employment Status",
+  seekerDays: "Days Available",     // still fetched for future use
+
+  openingPosition: "Position",
+  openingEmployment: "Employment Status",
+  openingDays: "Days Available",    // still fetched for future use
+};
+
+const RULES = {
+  requireEmploymentMatch: true,   // soft gate ON
+  requireDaysOverlap: false,      // gate OFF (score handles it)
+};
+
+function normText(v) {
+  return (v ?? "").toString().trim().toLowerCase();
+}
+
+// Handles: array of strings, array of {name}, single {name}, comma-separated
+function normMulti(cellVal) {
+  if (!cellVal) return new Set();
+
+  if (Array.isArray(cellVal)) {
+    if (cellVal.length && typeof cellVal[0] === "string") {
+      return new Set(cellVal.map(normText).filter(Boolean));
+    }
+    return new Set(cellVal.map(v => normText(v?.name)).filter(Boolean));
+  }
+
+  if (typeof cellVal === "object" && cellVal.name) {
+    return new Set([normText(cellVal.name)].filter(Boolean));
+  }
+
+  const s = normText(cellVal);
+  if (!s) return new Set();
+  return new Set(s.split(",").map(normText).filter(Boolean));
+}
+
+function hasOverlap(setA, setB) {
+  for (let v of setA) if (setB.has(v)) return true;
+  return false;
+}
+
+// Load existing matches to avoid duplicates
+const existingMatches = await matchesTbl.selectRecordsAsync({
+  fields: ["Job Seeker", "Job Opening"]
+});
+const existingPairKeys = new Set();
+for (const m of existingMatches.records) {
+  const sId = m.getCellValue("Job Seeker")?.[0]?.id;
+  const oId = m.getCellValue("Job Opening")?.[0]?.id;
+  if (sId && oId) existingPairKeys.add(`${sId}__${oId}`);
+}
+
+// Fetch seekers + openings
+const seekers = await seekersTbl.selectRecordsAsync({
+  fields: [FIELDS.seekerPosition, FIELDS.seekerEmployment, FIELDS.seekerDays]
+});
+const openings = await openingsTbl.selectRecordsAsync({
+  fields: [FIELDS.openingPosition, FIELDS.openingEmployment, FIELDS.openingDays]
+});
+
+let toCreate = [];
+let matchCount = 0;
+
+for (const s of seekers.records) {
+  const seekerPositions = normMulti(s.getCellValue(FIELDS.seekerPosition));
+  if (seekerPositions.size === 0) continue;
+
+  const seekerEmp = normText(s.getCellValueAsString(FIELDS.seekerEmployment));
+
+  for (const o of openings.records) {
+    const openingPositions = normMulti(o.getCellValue(FIELDS.openingPosition));
+    if (openingPositions.size === 0) continue;
+
+    // REQUIRED: Position overlap
+    if (!hasOverlap(seekerPositions, openingPositions)) continue;
+
+    // SOFT GATE: Employment only blocks if both filled AND different
+    if (RULES.requireEmploymentMatch) {
+      const openingEmp = normText(o.getCellValueAsString(FIELDS.openingEmployment));
+      if (seekerEmp && openingEmp && seekerEmp !== openingEmp) continue;
+    }
+
+    const key = `${s.id}__${o.id}`;
+    if (existingPairKeys.has(key)) continue;
+
+    toCreate.push({
+      fields: {
+        "Job Seeker": [{ id: s.id }],
+        "Job Opening": [{ id: o.id }]
+      }
+    });
+
+    matchCount++;
+
+    if (toCreate.length === 50) {
+      await matchesTbl.createRecordsAsync(toCreate);
+      toCreate = [];
+    }
+  }
+}
+
+if (toCreate.length) await matchesTbl.createRecordsAsync(toCreate);
+
+output.text(`✅ Script finished. Matches created: ${matchCount}`);
