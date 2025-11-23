@@ -1,0 +1,138 @@
+/********************
+ * MATCH SCRIPT v5
+ * - Position overlap REQUIRED (multi-position seekers)
+ * - Employment SOFT gate ON
+ * - Days NOT gating (score handles day strength)
+ * - Optional REBUILD mode
+ ********************/
+
+const seekersTbl  = base.getTable("Job Seekers AT");
+const openingsTbl = base.getTable("Job Openings AT");
+const matchesTbl  = base.getTable("Matches");
+
+// === TOGGLE THIS ===
+const REBUILD_MATCHES_EACH_RUN = false; 
+// set to true if you want to wipe Matches and rebuild fresh every run
+
+const FIELDS = {
+  seekerPosition: "Position",
+  seekerEmployment: "Employment Status",
+
+  openingPosition: "Position",
+  openingEmployment: "Employment Status",
+};
+
+function normText(v) {
+  return (v ?? "").toString().trim().toLowerCase();
+}
+
+// Handles: array of strings, array of {name}, single {name}, comma-separated
+function normMulti(cellVal) {
+  if (!cellVal) return new Set();
+
+  if (Array.isArray(cellVal)) {
+    if (cellVal.length && typeof cellVal[0] === "string") {
+      return new Set(cellVal.map(normText).filter(Boolean));
+    }
+    return new Set(cellVal.map(v => normText(v?.name)).filter(Boolean));
+  }
+
+  if (typeof cellVal === "object" && cellVal.name) {
+    return new Set([normText(cellVal.name)].filter(Boolean));
+  }
+
+  const s = normText(cellVal);
+  if (!s) return new Set();
+  return new Set(s.split(",").map(normText).filter(Boolean));
+}
+
+function hasOverlap(setA, setB) {
+  for (let v of setA) if (setB.has(v)) return true;
+  return false;
+}
+
+// 0) Optional rebuild: delete all existing Matches
+if (REBUILD_MATCHES_EACH_RUN) {
+  const existing = await matchesTbl.selectRecordsAsync();
+  let batch = [];
+  for (const r of existing.records) {
+    batch.push(r.id);
+    if (batch.length === 50) {
+      await matchesTbl.deleteRecordsAsync(batch);
+      batch = [];
+    }
+  }
+  if (batch.length) await matchesTbl.deleteRecordsAsync(batch);
+}
+
+// 1) Load existing matches to avoid duplicates (if not rebuilding)
+const existingPairKeys = new Set();
+if (!REBUILD_MATCHES_EACH_RUN) {
+  const existingMatches = await matchesTbl.selectRecordsAsync({
+    fields: ["Job Seeker", "Job Opening"]
+  });
+  for (const m of existingMatches.records) {
+    const sId = m.getCellValue("Job Seeker")?.[0]?.id;
+    const oId = m.getCellValue("Job Opening")?.[0]?.id;
+    if (sId && oId) existingPairKeys.add(`${sId}__${oId}`);
+  }
+}
+
+// 2) Fetch seekers + openings
+const seekers = await seekersTbl.selectRecordsAsync({
+  fields: [FIELDS.seekerPosition, FIELDS.seekerEmployment]
+});
+const openings = await openingsTbl.selectRecordsAsync({
+  fields: [FIELDS.openingPosition, FIELDS.openingEmployment]
+});
+
+let toCreate = [];
+let createdCount = 0;
+let positionOverlapPairs = 0;
+let employmentSoftPassPairs = 0;
+
+// 3) Cross-compare
+for (const s of seekers.records) {
+  const seekerPositions = normMulti(s.getCellValue(FIELDS.seekerPosition));
+  if (seekerPositions.size === 0) continue;
+
+  const seekerEmp = normText(s.getCellValueAsString(FIELDS.seekerEmployment));
+
+  for (const o of openings.records) {
+    const openingPositions = normMulti(o.getCellValue(FIELDS.openingPosition));
+    if (openingPositions.size === 0) continue;
+
+    // Position overlap required
+    if (!hasOverlap(seekerPositions, openingPositions)) continue;
+    positionOverlapPairs++;
+
+    // Employment SOFT gate: only block if both present AND different
+    const openingEmp = normText(o.getCellValueAsString(FIELDS.openingEmployment));
+    if (seekerEmp && openingEmp && seekerEmp !== openingEmp) continue;
+    employmentSoftPassPairs++;
+
+    const key = `${s.id}__${o.id}`;
+    if (existingPairKeys.has(key)) continue;
+
+    toCreate.push({
+      fields: {
+        "Job Seeker": [{ id: s.id }],
+        "Job Opening": [{ id: o.id }]
+      }
+    });
+    createdCount++;
+
+    if (toCreate.length === 50) {
+      await matchesTbl.createRecordsAsync(toCreate);
+      toCreate = [];
+    }
+  }
+}
+
+if (toCreate.length) await matchesTbl.createRecordsAsync(toCreate);
+
+// 4) Output so you KNOW what happened
+output.text(`Position-overlap candidate pairs found: ${positionOverlapPairs}`);
+output.text(`Pairs passing soft employment gate: ${employmentSoftPassPairs}`);
+output.text(`New Matches created this run: ${createdCount}`);
+output.text(`REBUILD mode: ${REBUILD_MATCHES_EACH_RUN}`);
